@@ -71,6 +71,21 @@ PRO_MONTHLY_RUB = 1490.00  # Базовый PRO «за парсер» до 5 ч�
 EXTRA_CHAT_MONTHLY_RUB = 490.00  # За каждый чат сверх 5
 DAYS_IN_MONTH = 30
 
+BOT_USERNAME = os.getenv("BOT_USERNAME", "TOPGrabber_bot").lstrip("@")
+
+
+def encode_ref_code(user_id: int) -> str:
+    """Return a short referral code for the given user id."""
+    return format(int(user_id), "x")
+
+
+def decode_ref_code(code: str) -> int | None:
+    """Try to decode referral code back to a user id."""
+    try:
+        return int(code, 16)
+    except (TypeError, ValueError):
+        return None
+
 
 PAYOUT_SHOP_ID = os.getenv("PAYOUT_SHOP_ID")
 PAYOUT_SECRET_KEY = os.getenv("PAYOUT_SECRET_KEY")
@@ -385,12 +400,27 @@ def t(key, **kwargs):
     return text
 
 
+def ensure_referral_defaults(entry: dict, user_id: int) -> None:
+    """Populate default fields for referral/partner program."""
+    entry.setdefault('ref_code', encode_ref_code(user_id))
+    referrer = entry.get('referrer_id')
+    try:
+        entry['referrer_id'] = int(referrer) if referrer is not None else None
+    except (TypeError, ValueError):
+        entry['referrer_id'] = None
+    entry['ref_count'] = int(entry.get('ref_count', 0) or 0)
+    entry['ref_active_users'] = int(entry.get('ref_active_users', 0) or 0)
+    entry['ref_month_income'] = float(entry.get('ref_month_income', 0.0) or 0.0)
+    entry['ref_total'] = float(entry.get('ref_total', 0.0) or 0.0)
+    entry['ref_balance'] = float(entry.get('ref_balance', 0.0) or 0.0)
+
+
 def load_user_data():
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for u in data.values():
+            for uid, u in data.items():
                 u.setdefault('subscription_expiry', 0)
                 u.setdefault('recurring', False)
                 u.setdefault('reminder3_sent', False)
@@ -400,6 +430,7 @@ def load_user_data():
                 u.setdefault('chat_limit', CHAT_LIMIT)
                 u.setdefault('balance', 0.0)  # новый кошелёк пользователя
                 u.setdefault('billing_enabled', True)  # флаг на будущее
+                ensure_referral_defaults(u, int(uid))
                 # Старые поля подписки можно оставить — они не будут использоваться
                 for p in u.get('parsers', []):
                     p.setdefault('results', [])
@@ -437,7 +468,53 @@ def get_user_data_entry(user_id: int):
     data = user_data.setdefault(str(user_id), {})
     data.setdefault('chat_limit', CHAT_LIMIT)
     data.setdefault('balance', 0.0)
+    ensure_referral_defaults(data, user_id)
     return data
+
+
+def build_referral_link(user_id: int) -> str:
+    """Construct referral link for user."""
+    code = encode_ref_code(user_id)
+    entry = get_user_data_entry(user_id)
+    # ensure stored code (in case format changes later)
+    if entry.get('ref_code') != code:
+        entry['ref_code'] = code
+        save_user_data(user_data)
+    return f"https://t.me/{BOT_USERNAME}?start=ref_{code}"
+
+
+def get_export_limit(user_id: int) -> int:
+    """Return max number of rows allowed for CSV export based on plan."""
+    data = user_data.get(str(user_id), {})
+    now = int(datetime.utcnow().timestamp())
+    if data.get('subscription_expiry', 0) > now:
+        return 250
+    if data.get('infinity_active'):
+        return 250
+    return 10
+
+
+async def handle_common_commands(message: types.Message, state: FSMContext) -> bool:
+    """Allow global commands to work even when FSM state is active."""
+    text = (message.text or '').strip()
+    if not text.startswith('/'):
+        return False
+    lowered = text.lower()
+    if lowered.startswith('/menu'):
+        await cmd_menu(message, state)
+        return True
+    if lowered.startswith('/start'):
+        await cmd_start(message, state)
+        return True
+    if lowered.startswith('/help'):
+        await state.finish()
+        await cmd_help(message)
+        return True
+    if lowered.startswith('/cancel'):
+        await state.finish()
+        await ui_send_new(message.from_user.id, "Действие отменено.", reply_markup=main_menu_keyboard())
+        return True
+    return False
 
 
 def create_payment(user_id: int, amount: str, description: str, user_email:str = None, user_phone: str = None):
@@ -782,6 +859,9 @@ def main_menu_keyboard() -> types.InlineKeyboardMarkup:
             "🛠 Настройка и оплата парсеров", callback_data="menu_setup"
         ),
         types.InlineKeyboardButton(
+            "💼 Тарифы", callback_data="menu_tariffs"
+        ),
+        types.InlineKeyboardButton(
             "📤 Экспорт результатов в таблицу", callback_data="menu_export"
         ),
         types.InlineKeyboardButton(
@@ -791,6 +871,25 @@ def main_menu_keyboard() -> types.InlineKeyboardMarkup:
             "🤝 Профиль и Партнёрская программа", callback_data="menu_profile"
         ),
     )
+    return kb
+
+
+def infinity_info_text() -> str:
+    return (
+        "💠 Тариф INFINITY — 149 990 ₽/мес.\n"
+        "• Неограниченно: чаты и ключевые слова\n"
+        "• Персональный аккаунт-менеджер\n"
+        "• Чат поддержки 24/7\n"
+        "• Выделенный VPS под ваши задачи\n\n"
+        "Для подключения напишите @TopGrabberSupport."
+    )
+
+
+def infinity_info_keyboard(back_callback: str | None = None) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("Подключить", url="https://t.me/antufev2025"))
+    if back_callback:
+        kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data=back_callback))
     return kb
 
 
@@ -883,6 +982,8 @@ async def cmd_topup(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=TopUpStates.waiting_amount)
 async def topup_amount(message: types.Message, state: FSMContext):
+    if await handle_common_commands(message, state):
+        return
     text = message.text.replace(',', '.').strip()
     try:
         amount = float(text)
@@ -985,12 +1086,23 @@ def parser_info_text(user_id: int, parser: dict, created: bool = False) -> str:
 @dp.message_handler(commands=['start'], state="*")
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.finish()
+    args = (message.get_args() or '').strip()
+    uid = message.from_user.id
+    if args.lower().startswith('ref_'):
+        code = args[4:]
+        ref_id = decode_ref_code(code)
+        if ref_id and ref_id != uid:
+            entry = get_user_data_entry(uid)
+            if not entry.get('referrer_id'):
+                entry['referrer_id'] = ref_id
+                ref_entry = get_user_data_entry(ref_id)
+                ref_entry['ref_count'] = int(ref_entry.get('ref_count', 0)) + 1
+                save_user_data(user_data)
     check_subscription(message.from_user.id)
     data = get_user_data_entry(message.from_user.id)
     if not data.get('started'):
         data['started'] = True
         save_user_data(user_data)
-    uid = message.from_user.id
     await ui_send_new(uid, t('welcome'), reply_markup=main_menu_keyboard())
 
 
@@ -1090,9 +1202,35 @@ async def cb_delp_confirm(call: types.CallbackQuery):
     await call.answer()
 
 
-@dp.callback_query_handler(lambda c: c.data == 'back_main')
-async def cb_back_main(call: types.CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data == 'back_main', state='*')
+async def cb_back_main(call: types.CallbackQuery, state: FSMContext):
+    await state.finish()
     await ui_from_callback_edit(call, t('menu_main'), reply_markup=main_menu_keyboard())
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'menu_tariffs')
+async def cb_menu_tariffs(call: types.CallbackQuery):
+    text = (
+        "Выберите подходящий тариф:\n\n"
+        "PRO — 1 490 ₽/мес за 5 чатов (дополнительные чаты по 490 ₽).\n"
+        "На демо-доступе выгрузка ограничена 10 результатами. После оплаты тарифа PRO или INFINITY доступно до 250 последних результатов.\n\n"
+        "INFINITY — премиальный тариф без ограничений по чатам и словам."
+    )
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("✨ Перейти на PRO", callback_data='tariff_pro'),
+        types.InlineKeyboardButton("💠 Подробнее об INFINITY", callback_data='tariff_infinity_info'),
+        types.InlineKeyboardButton("🔙 Назад", callback_data='back_main'),
+    )
+    await ui_from_callback_edit(call, text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'tariff_infinity_info')
+async def cb_tariff_infinity_info(call: types.CallbackQuery):
+    kb = infinity_info_keyboard(back_callback='menu_tariffs')
+    await ui_from_callback_edit(call, infinity_info_text(), reply_markup=kb)
     await call.answer()
 
 
@@ -1176,19 +1314,17 @@ async def cb_pay_expand(call: types.CallbackQuery, state: FSMContext):
 @dp.callback_query_handler(lambda c: c.data.startswith('pay_infinity_'))
 async def cb_pay_infinity(call: types.CallbackQuery):
     """Inform about INFINITY plan."""
-    keyboard111 = types.InlineKeyboardMarkup()
-    keyboard111.add(types.InlineKeyboardButton(text="Подключить", url="https://t.me/antufev2025"))
-    await ui_from_callback_edit(call, 
-        "Тариф INFINITY — 149 990 ₽/мес. Неограниченные чаты и слова, персональный аккаунт-менеджер.\n"
-        "Для подключения напишите @TopGrabberSupport",
-        reply_markup=keyboard111
-    )
+    idx = call.data.split('_')[2]
+    kb = infinity_info_keyboard(back_callback=f'pay_select_{idx}')
+    await ui_from_callback_edit(call, infinity_info_text(), reply_markup=kb)
     await call.answer()
 
 
 @dp.message_handler(state=ExpandProStates.waiting_chats)
 async def expand_pro_chats(message: types.Message, state: FSMContext):
     """Handle number of chats for PRO expansion."""
+    if await handle_common_commands(message, state):
+        return
     text = message.text.strip()
     if not text.isdigit() or int(text) <= 0:
         await ui_send_new(message.from_user.id, "Введите количество чатов числом")
@@ -1352,7 +1488,8 @@ async def cb_menu_profile(call: types.CallbackQuery):
         f"Баланс: {balance:.2f} ₽\n"
         f"Общая стоимость: {per_day:.2f} ₽/день"
     )
-    text = text + extra
+    ref_link = build_referral_link(call.from_user.id)
+    text = text + extra + f"\n\n🔗 Ваша реферальная ссылка:\n{ref_link}"
 
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
@@ -1374,9 +1511,17 @@ async def cb_menu_profile(call: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == 'profile_topup')
 async def cb_profile_topup(call: types.CallbackQuery):
-    await ui_from_callback_edit(call, "Введите сумму пополнения (минимум 300 ₽):")
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_profile"))
+    await ui_from_callback_edit(call, "Введите сумму пополнения (минимум 300 ₽):", reply_markup=kb)
     await TopUpStates.waiting_amount.set()
     await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'back_profile', state='*')
+async def cb_back_profile(call: types.CallbackQuery, state: FSMContext):
+    await state.finish()
+    await cb_menu_profile(call)
 
 
 @dp.callback_query_handler(lambda c: c.data == 'profile_paybalance')
@@ -1394,6 +1539,8 @@ async def cb_profile_paybalance(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message_handler(state=PartnerTransferStates.waiting_amount)
 async def partner_transfer_amount(message: types.Message, state: FSMContext):
+    if await handle_common_commands(message, state):
+        return
     text = message.text.replace(',', '.').strip()
     try:
         amount = float(text)
@@ -1432,6 +1579,8 @@ async def cb_profile_withdraw(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message_handler(state=WithdrawStates.waiting_amount)
 async def withdraw_amount(message: types.Message, state: FSMContext):
+    if await handle_common_commands(message, state):
+        return
     text = (message.text or "").replace(',', '.').strip()
     try:
         amount = float(text)
@@ -1482,6 +1631,8 @@ async def withdraw_pick_method(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message_handler(state=WithdrawStates.waiting_destination)
 async def withdraw_destination(message: types.Message, state: FSMContext):
+    if await handle_common_commands(message, state):
+        return
     dest_raw = (message.text or "").strip().replace(" ", "")
     data = await state.get_data()
     method = data.get("method")
@@ -1612,6 +1763,8 @@ async def cb_tariff_pro(call: types.CallbackQuery, state: FSMContext):
 @dp.message_handler(state=PromoStates.waiting_promo)
 async def promo_entered(message: types.Message, state: FSMContext):
     text_raw = (message.text or "").strip()
+    if await handle_common_commands(message, state):
+        return
     code = text_raw.upper()
     user_id = message.from_user.id
 
@@ -1823,12 +1976,19 @@ async def send_all_results(user_id: int):
     if not rows:
         await safe_send_message(bot, user_id, t('no_results'))
         return
+    limit = get_export_limit(user_id)
+    total_rows = len(rows)
+    rows = rows[-limit:]
     path = f"results_{user_id}_all.csv"
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["keyword", "chat", "sender", "datetime", "link", "text"])
-        writer.writerows(rows)
-    await bot.send_document(user_id, types.InputFile(path), caption=t('csv_export_ready'))
+        writer.writerow(["#", "Ключевое слово", "Чат", "Автор", "Дата", "Ссылка", "Сообщение"])
+        for idx, row in enumerate(rows, 1):
+            writer.writerow([idx, *row])
+    caption = t('csv_export_ready')
+    if total_rows > limit:
+        caption += f"\nПоказаны последние {limit} из {total_rows} записей."
+    await bot.send_document(user_id, types.InputFile(path), caption=caption)
     os.remove(path)
 
 async def send_parser_results(user_id: int, idx: int):
@@ -1843,12 +2003,16 @@ async def send_parser_results(user_id: int, idx: int):
     if not results:
         await safe_send_message(bot, user_id, t('no_results'))
         return
+    limit = get_export_limit(user_id)
+    total_rows = len(results)
+    results = results[-limit:]
     path = f"results_{user_id}_{idx + 1}.csv"
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["keyword", "chat", "sender", "datetime", "link", "text"])
-        for r in results:
+        writer.writerow(["#", "Ключевое слово", "Чат", "Автор", "Дата", "Ссылка", "Сообщение"])
+        for idx_row, r in enumerate(results, 1):
             writer.writerow([
+                idx_row,
                 r.get('keyword', ''),
                 r.get('chat', ''),
                 r.get('sender', ''),
@@ -1856,7 +2020,10 @@ async def send_parser_results(user_id: int, idx: int):
                 r.get('link', ''),
                 r.get('text', '').replace('\n', ' '),
             ])
-    await bot.send_document(user_id, types.InputFile(path))
+    caption = t('csv_export_ready')
+    if total_rows > limit:
+        caption += f"\nПоказаны последние {limit} из {total_rows} записей."
+    await bot.send_document(user_id, types.InputFile(path), caption=caption)
     os.remove(path)
 
 # Handler for callbacks like "edit_1" which allow choosing what to edit for a
@@ -1923,6 +2090,8 @@ async def cb_edit_tariff(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message_handler(state=ParserStates.waiting_name)
 async def get_parser_name(message: types.Message, state: FSMContext):
+    if await handle_common_commands(message, state):
+        return
     name = message.text.strip()
     if not name:
         await ui_send_new(message.from_user.id, "Название не может быть пустым. Попробуйте ещё раз:")
@@ -2056,6 +2225,8 @@ API_HASH = "553319645d024ed8353cb482a98f23f1"
 
 @dp.message_handler(state=AuthStates.waiting_phone)
 async def get_phone(message: types.Message, state: FSMContext):
+    if await handle_common_commands(message, state):
+        return
     phone = (message.text or "").strip()
     user_id = message.from_user.id
     
@@ -2125,6 +2296,8 @@ async def _ensure_client(user_id: int, api_id: int, api_hash: str) -> TelegramCl
 
 @dp.message_handler(state=AuthStates.waiting_telethon_code)
 async def get_telethon_code(message: types.Message, state: FSMContext):
+    if await handle_common_commands(message, state):
+        return
     # Оставляем только цифры (в Telegram код числовой)
     raw = (message.text or "").strip()
     code = re.sub(r"\D", "", raw)
@@ -2219,6 +2392,8 @@ async def get_telethon_code(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=AuthStates.waiting_password)
 async def get_password(message: types.Message, state: FSMContext):
+    if await handle_common_commands(message, state):
+        return
     password = (message.text or "").strip()
     user_id = message.from_user.id
 
@@ -2259,6 +2434,8 @@ async def get_password(message: types.Message, state: FSMContext):
         return
 
 async def _process_chats(message: types.Message, state: FSMContext, next_state):
+    if await handle_common_commands(message, state):
+        return None
     text = message.text.strip().replace(',', ' ')
     parts = [p for p in text.split() if p]
     user_id = message.from_user.id
@@ -2303,6 +2480,8 @@ async def get_chats_parser(message: types.Message, state: FSMContext):
 
 
 async def _process_keywords(message: types.Message, state: FSMContext):
+    if await handle_common_commands(message, state):
+        return
     keywords = [w.strip().lower() for w in message.text.split(',') if w.strip()]
     if not keywords:
         await ui_send_new(message.from_user.id, "⚠️ Пустой список. Введите хотя бы одно слово:")
@@ -2364,6 +2543,8 @@ async def get_keywords_parser(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=EditParserStates.waiting_chats)
 async def edit_chats_handler(message: types.Message, state: FSMContext):
+    if await handle_common_commands(message, state):
+        return
     data = await state.get_data()
     idx = data.get('edit_idx')
     text = message.text.strip().replace(',', ' ')
@@ -2401,6 +2582,8 @@ async def edit_chats_handler(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=EditParserStates.waiting_keywords)
 async def edit_keywords_handler(message: types.Message, state: FSMContext):
+    if await handle_common_commands(message, state):
+        return
     data = await state.get_data()
     idx = data.get('edit_idx')
     keywords = [w.strip().lower() for w in message.text.split(',') if w.strip()]
@@ -2420,6 +2603,8 @@ async def edit_keywords_handler(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=EditParserStates.waiting_exclude)
 async def edit_exclude_handler(message: types.Message, state: FSMContext):
+    if await handle_common_commands(message, state):
+        return
     data = await state.get_data()
     idx = data.get('edit_idx')
     words = [w.strip().lower() for w in message.text.split(',') if w.strip()]
@@ -2437,6 +2622,8 @@ async def edit_exclude_handler(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=EditParserStates.waiting_name)
 async def edit_name_handler(message: types.Message, state: FSMContext):
+    if await handle_common_commands(message, state):
+        return
     data = await state.get_data()
     idx = data.get('edit_idx')
     new_name = message.text.strip()
